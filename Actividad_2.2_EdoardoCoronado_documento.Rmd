@@ -1,0 +1,216 @@
+---
+title: "Análisis de Datos Ómicos - Actividad 2.2"
+author: "Edoardo Emilio Coronado Barrientos - IDP: 1338924"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+geometry: margin=2cm
+fontsize: 11pt
+header-includes:
+  - \renewcommand{\figurename}{Figura}
+  - \renewcommand{\tablename}{Tabla}
+bibliography: ./referencias/referencias.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  comment = NA
+)
+
+# Librerías necesarias
+library(oligo)
+library(Biobase)
+library(knitr)
+library(kableExtra)
+library(limma)
+library(genefilter)
+library(pvca)
+library(pd.hg.u133.plus.2)
+library(hgu133plus2.db)
+library(annotate)
+library(org.Hs.eg.db)
+library(gplots)
+library(ggplot2)
+library(ggrepel)
+library(ReactomePA)
+library(cowplot) # Para agrupar las imágenes
+library(png)     # Para leer las imágenes
+
+# Definición de directorios
+dat_dir <- "./datos"
+res_dir <- "./resultados"
+fig_dir <- "./figuras"
+```
+
+# Efecto del tratamiento con SAHM1 en la expresión de células T-ALL
+
+El estudio seleccionado se centró en medir los cambios globales en la expresión génica tras el tratamiento de las líneas celulares T-ALL humanas HPB-ALL y KOPT-K1 con solo vehículo DMSO o SAHM1 [@moellering2009sahm1]. Cada combinación se hizo por triplicado y se hibridó en chips Affymetrix HG-U133 Plus 2.0, con un total de 12 arreglos. Para plantear el modelo lineal se sigue el mismo procedimiento del caso de estudio del material [@gonzalo2019microarrays], que usa el paquete \texttt{limma}.
+
+## 1. Diseño experimental, factores y niveles
+
+Es un diseño factorial \(2\times2\) completo y balanceado, con dos factores cruzados de efectos fijos:
+
+- **Línea celular** (factor biológico): KOPT-K1 y HPB-ALL.
+- **Tratamiento** (factor de interés): DMSO y SAHM1.
+
+Al cruzar los dos factores salen 4 grupos experimentales con 3 réplicas biológicas cada uno, es decir, \(4 \times 3 = 12\) muestras. Como en el material, los dos factores se pueden juntar en una sola variable `Grupo` con 4 niveles. Así cada coeficiente del modelo es la expresión media de un grupo, y las comparaciones se escriben fácil como contrastes.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+fichero_targets <- file.path(dat_dir, "targets.csv")
+targets_df <- read.csv2(fichero_targets, header=TRUE, sep=";")
+niveles <- c("KOPT.DMSO", "HPB.DMSO", "KOPT.SAHM1", "HPB.SAHM1")
+targets_df$Grupo <- factor(targets_df$Grupo, levels=niveles)
+
+kbl(targets_df, booktabs = TRUE,
+    caption = "Asignación de las 12 muestras a los grupos",
+    font_size = 8) |>
+  kable_styling(latex_options = "HOLD_position")
+```
+
+## 2. Control de Calidad y Preprocesamiento
+
+Se cargaron los 12 archivos CEL y se realizó un análisis de control de calidad (Figura 1). Se observó una clara separación de las muestras según la línea celular en el PCA y el clustering jerárquico. El análisis PVCA confirmó que la mayor variabilidad proviene de la **Línea Celular** (factor biológico), por lo que se descarta el impacto de un efecto de lote significativo. Posteriormente, los datos se normalizaron mediante el algoritmo `rma` y se filtraron por varianza (IQR) y expresión, reteniendo 5,203 genes.
+
+```{r qc-chunks, include=FALSE}
+# Carga y normalización silenciosa (no se muestra en el PDF)
+fichero_gse_raw_rds <- file.path(dat_dir, "gse_raw.rds")
+if (file.exists(fichero_gse_raw_rds)) {
+  gse_raw <- readRDS(fichero_gse_raw_rds)
+} else {
+  targets_adf <- read.AnnotatedDataFrame(file.path(dat_dir,"targets.csv"),header=TRUE, row.names=1, sep=";")
+  ficheros_cel <- list.celfiles(dat_dir, full.names=TRUE)
+  gse_raw <- read.celfiles(ficheros_cel, phenoData=targets_adf)
+  saveRDS(gse_raw, file.path("./datos/gse_raw.rds"))
+}
+
+if (!exists("targets_adf")) {
+  targets_adf <- read.AnnotatedDataFrame(file.path(dat_dir, "targets.csv"), header = TRUE, row.names = 1, sep = ";")
+}
+rownames(pData(gse_raw)) <- pData(targets_adf)$Muestra
+colnames(gse_raw) <- rownames(pData(gse_raw))
+
+if (!exists("eset_rma")) {
+  eset_rma <- rma(gse_raw)
+}
+
+if (!exists("eset_filter")) {
+  annotation(eset_rma) <- "hgu133plus2.db"
+  eset_filter <- nsFilter(eset_rma, var.func=IQR, var.cutoff=0.75,
+    var.filter=TRUE, require.entrez=TRUE, remove.dupEntrez=TRUE, 
+    filterByQuantile=TRUE)
+  eset_f <- eset_filter$eset
+  filter_log <- eset_filter$filter.log
+  saveRDS(eset_f, file.path(res_dir, "eset_f.rds"))
+  saveRDS(filter_log, file.path(res_dir, "filter_log.rds"))
+}
+
+FilteredEset <- eset_filter$eset
+FilteredData <- exprs(FilteredEset)
+colnames(FilteredData) <- pData(eset_filter$eset)$Muestra
+```
+
+```{r, echo=FALSE, out.width="100%", fig.cap="Figura 1: Análisis de calidad, clustering, PCA y PVCA de los datos."}
+# Se agrupan las 4 imágenes en un solo bloque usando cowplot
+img_qc <- c("./figuras/boxplot_gse_raw.png", "./figuras/hcluster_gse_raw.png", 
+            "./figuras/pca_gse_raw.png", "./figuras/pvca_eset_rma.png")
+gros_qc <- lapply(img_qc, function(x) grid::rasterGrob(png::readPNG(x)))
+plot_grid(plotlist = gros_qc, ncol = 2)
+```
+
+
+## 3. Modelo lineal y Matrices
+
+Para cada gen \(g\), el modelo lineal es:
+
+$$
+y_{gij} = \mu_{gi} + \varepsilon_{gij}, \quad
+i \in \{\text{KOPT.DMSO}, \text{HPB.DMSO}, \text{KOPT.SAHM1}, \text{HPB.SAHM1}\},
+\quad j = 1, 2, 3
+$$
+
+donde \(y_{gij}\) es la expresión normalizada de la réplica \(j\) del grupo \(i\), \(\mu_{gi}\) es la media del grupo y \(\varepsilon_{gij} \sim N(0, \sigma_g^2)\) es el error aleatorio. En forma de matriz se escribe como \(\mathbf{y}_g = \mathbf{X}\boldsymbol{\beta}_g + \boldsymbol{\varepsilon}_g\).
+
+Como el diseño es factorial, el modelo también se puede parametrizar en términos de los efectos principales y la interacción:
+
+$$
+y_{gijk} = \mu_g + \alpha_{g,i} + \beta_{g,j} + (\alpha\beta)_{g,ij} + \varepsilon_{gijk}
+$$
+
+### Matriz de diseño
+
+La matriz de diseño \(\mathbf{X}\) tiene una fila por muestra (12) y una columna por grupo (4). Se arma sin intercepto (`~ 0 + Grupo`), igual que en el material: cada fila lleva un 1 en la columna de su grupo y 0 en las demás.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+designMat1 <- model.matrix(~ 0 + Grupo, data=targets_df)
+colnames(designMat1) <- levels(targets_df$Grupo)
+rownames(designMat1) <- targets_df$Muestra
+designMat1
+```
+
+### Matriz de contrastes
+
+La matriz de contrastes \(\mathbf{C}\) tiene una fila por cada coeficiente del modelo y una columna por cada comparación. Los coeficientes de cada columna suman cero:
+
+a. Efecto de SAHM1 en KOPT-K1: \(\mu_{\text{KOPT.SAHM1}} - \mu_{\text{KOPT.DMSO}}\).
+b. Efecto de SAHM1 en HPB-ALL: \(\mu_{\text{HPB.SAHM1}} - \mu_{\text{HPB.DMSO}}\).
+c. Interacción: \((\mu_{\text{KOPT.SAHM1}} - \mu_{\text{KOPT.DMSO}}) - (\mu_{\text{HPB.SAHM1}} - \mu_{\text{HPB.DMSO}})\).
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+cont.matrix1 <- makeContrasts(
+  SAHM1vsDMSO.KOPT = KOPT.SAHM1 - KOPT.DMSO,
+  SAHM1vsDMSO.HPB  = HPB.SAHM1  - HPB.DMSO,
+  INT = (KOPT.SAHM1 - KOPT.DMSO) - (HPB.SAHM1 - HPB.DMSO),
+  levels = designMat1)
+cont.matrix1
+```
+
+Para cada gen se estima \(\boldsymbol{\gamma}_g = \mathbf{C}^{T}\hat{\boldsymbol{\beta}}_g\), que contiene los tres contrastes de interés. El ajuste del modelo se realizó con `limma`:
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+# Ajuste del modelo
+fit1      <- lmFit(FilteredData, designMat1)
+fit.main1 <- contrasts.fit(fit1, cont.matrix1)
+fit.main1 <- eBayes(fit.main1)
+```
+
+
+## 4. Resultados
+
+Para identificar los genes diferencialmente expresados, se utilizó un umbral de \(FDR < 0.1\) y un \(|\log_2(\text{Fold Change})| > 1\). La Tabla 2 muestra el resumen de genes significativos (arriba y abajo) para cada uno de los tres contrastes evaluados.
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+res <- decideTests(fit.main1, method="separate", adjust.method="fdr", p.value=0.1, lfc=1)
+kable(summary(res), caption = "Resumen de genes diferencialmente expresados por contraste")
+```
+
+En la Figura 2 se presentan los gráficos de volcán para los contrastes a (KOPT) y b (HPB), así como para la interacción (INT). Además, el diagrama de Venn ilustra el solapamiento de genes significativos entre las tres comparaciones.
+
+```{r, echo=FALSE, out.width="100%", fig.cap="Figura 2: Volcanes de expresión diferencial y diagrama de Venn."}
+# Se agrupan los 3 volcanes y el venn en un solo bloque
+img_deg <- c("./figuras/volcano_KPOT.png", "./figuras/volcano_HPB.png", 
+             "./figuras/volcano_INT.png", "./figuras/diagrama_venn.png")
+gros_deg <- lapply(img_deg, function(x) grid::rasterGrob(png::readPNG(x)))
+plot_grid(plotlist = gros_deg, ncol = 2)
+```
+
+Finalmente, para los contrastes a y b (efecto del tratamiento en cada línea celular), se realizó un análisis de significación biológica (enriquecimiento de vías) utilizando la base de datos de Reactome (Figura 3).
+
+```{r, echo=FALSE, out.width="100%", fig.cap="Figura 3: Análisis de enriquecimiento de vías de Reactome para los contrastes KOPT y HPB."}
+# Se agrupan las 2 imágenes de Reactome en una sola fila
+img_reactome <- c("./figuras/ReactomePABarplot.KOPT.png", "./figuras/ReactomePABarplot.HPB.png")
+gros_reactome <- lapply(img_reactome, function(x) grid::rasterGrob(png::readPNG(x)))
+plot_grid(plotlist = gros_reactome, ncol = 2)
+```
+
+
+## Conclusiones
+
+- El experimento es un diseño factorial \(2\times2\) (línea celular \(\times\) tratamiento) con 3 réplicas por grupo. Se modela con una matriz de diseño \(12 \times 4\) sin intercepto, donde cada coeficiente es la media de un grupo.
+- La matriz de contrastes \(4 \times 3\) responde a las tres preguntas: el efecto de SAHM1 en KOPT-K1, el efecto de SAHM1 en HPB-ALL y la interacción entre ambos.
+- Los resultados demuestran que el tratamiento con SAHM1 tiene un efecto diferencial dependiendo de la línea celular, lo cual se refleja en la baja cantidad de genes compartidos en el diagrama de Venn y en las distintas vías metabólicas enriquecidas en cada caso.
+
+# Referencias

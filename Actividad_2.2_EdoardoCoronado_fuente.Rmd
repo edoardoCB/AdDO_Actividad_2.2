@@ -1,0 +1,638 @@
+---
+title: "Análisis de Datos Ómicos - Actividad 2.2"
+author: "Edoardo Emilio Coronado Barrientos - IDP: 1338924"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc_depth: 2
+fontsize: 12pt
+header-includes:
+  - \renewcommand{\figurename}{Figura}
+  - \renewcommand{\tablename}{Tabla}
+bibliography: ./referencias/referencias.bib
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(
+  echo=TRUE,
+  message=FALSE,
+  warning=FALSE,
+  comment=NA
+)
+
+library(oligo)
+library(Biobase)
+library(knitr)
+library(kableExtra)
+library(limma)
+library(genefilter)
+library(arrayQualityMetrics)
+library(pvca)
+library(pd.hg.u133.plus.2)
+library(hgu133plus2.db)
+library(annotate)
+library(org.Hs.eg.db)
+library(gplots)
+library(ggplot2)
+library(ggrepel)
+library(ReactomePA)
+
+plotPCA3 <- function (datos, labels, factor, title, scale,colores, size = 1.5, glineas = 0.25) {
+  data <- prcomp(t(datos),scale=scale)
+  # plot adjustments
+  dataDf <- data.frame(data$x)
+  Group <- factor
+  loads <- round(data$sdev^2/sum(data$sdev^2)*100,1)
+  # main plot
+  p1 <- ggplot(dataDf,aes(x=PC1, y=PC2)) +
+    theme_classic() +
+    geom_hline(yintercept = 0, color = "gray70") +
+    geom_vline(xintercept = 0, color = "gray70") +
+    geom_point(aes(color = Group), alpha = 0.55, size = 3) +
+    coord_cartesian(xlim = c(min(data$x[,1])-5,max(data$x[,1])+5)) +
+    scale_fill_discrete(name = "Grupo")
+  # avoiding labels superposition
+  p1 + geom_text_repel(aes(y = PC2 + 0.25, label = labels),segment.size = 0.25, size = size) + 
+    labs(x = c(paste("PC1",loads[1],"%")),y=c(paste("PC2",loads[2],"%"))) +  
+    ggtitle(paste("PCA para: ",title,sep=" "))+ 
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_color_manual(values=colores)
+}
+
+
+annotatedTopTable <- function(topTab, anotPackage)
+{
+  topTab <- cbind(PROBEID=rownames(topTab), topTab)
+  myProbes <- rownames(topTab)
+  thePackage <- eval(parse(text = anotPackage))
+  geneAnots <- select(thePackage, myProbes, c("SYMBOL", "ENTREZID", "GENENAME"))
+  annotatedTopTab<- merge(x=geneAnots, y=topTab, by.x="PROBEID", by.y="PROBEID")
+return(annotatedTopTab)
+}
+```
+
+# Efecto del tratamiento con SAHM1 en la expresión de células T-ALL
+
+El estudio seleccionado se centró en medir los cambios globales en la
+expresión génica tras el tratamiento de las líneas celulares T-ALL humanas
+HPB-ALL y KOPT-K1 con solo vehículo DMSO o SAHM1 [@moellering2009sahm1].
+Cada combinación se hizo por triplicado y se hibridó en chips Affymetrix
+HG-U133 Plus 2.0, con un total de 12 arreglos. Para plantear el modelo
+lineal se sigue el mismo procedimiento del caso de estudio del material
+[@gonzalo2019microarrays], que usa el paquete \texttt{limma}.
+
+## 1. Diseño experimental, factores y niveles
+
+Es un diseño factorial $2\times2$ completo y balanceado, con dos factores
+cruzados de efectos fijos:
+
+- **Línea celular** (factor biológico): KOPT-K1 y HPB-ALL.
+- **Tratamiento** (factor de interés): DMSO y SAHM1.
+
+Al cruzar los dos factores salen 4 grupos experimentales con 3 réplicas
+biológicas cada uno, es decir, $4 \times 3 = 12$ muestras. Como en el
+material, los dos factores se pueden juntar en una sola variable `Grupo`
+con 4 niveles. Así cada coeficiente del modelo es la expresión media de un
+grupo, y las comparaciones se escriben fácil como contrastes.
+
+Los ficheros `CEL` se descargaron previamente de @GSE18198.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+# se crean variables de directorios
+dat_dir <- "./datos"
+res_dir <- "./resultados"
+fig_dir <- "./figuras"
+fichero_targets <- file.path(dat_dir, "targets.csv")
+# se genera la tabla "targets" con la información del fichero "targets.csv"
+targets_df <- read.csv2(fichero_targets, header=TRUE, sep=";")
+# se convierte la columna "Grupo" en factores
+niveles <- c("KOPT.DMSO", "HPB.DMSO", "KOPT.SAHM1", "HPB.SAHM1")
+targets_df$Grupo <- factor(targets_df$Grupo, levels=niveles)
+# se muestra la tabla "targets"
+#knitr::kable(targets_df, booktabs=TRUE,
+#             caption="Asignación de las 12 muestras a los grupos")
+kbl(targets_df, booktabs = TRUE,
+    caption = "Asignación de las 12 muestras a los grupos",
+    font_size = 8) |>
+  kable_styling(latex_options = "HOLD_position")
+```
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+fichero_gse_raw_rds <- file.path(dat_dir, "gse_raw.rds")
+if (file.exists(fichero_gse_raw_rds)) {
+  gse_raw <- readRDS(fichero_gse_raw_rds)
+} else {
+  # se genera la tabla "targets" como AnnotatedDataFrame
+  targets_adf <- read.AnnotatedDataFrame(
+  file.path(dat_dir,"targets.csv"),header=TRUE, row.names=1, sep=";")
+  # se cargan los ficheros CEL
+  ficheros_cel <- list.celfiles(dat_dir, full.names=TRUE)
+  # se genera el objeto de clase "ExpressionFeatureSet"
+  gse_raw <- read.celfiles(ficheros_cel, phenoData=targets_adf)
+  saveRDS(gse_raw, file.path("./datos/gse_raw.rds"))
+}
+gse_raw
+```
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+if (!exists("targets_adf")) {
+  targets_adf <- read.AnnotatedDataFrame(
+    file.path(dat_dir, "targets.csv"),
+    header = TRUE, row.names = 1, sep = ";"
+  )
+}
+# se renombran las columnas con el ID de muestra (GSM)
+rownames(pData(gse_raw)) <- pData(targets_adf)$Muestra
+colnames(gse_raw) <- rownames(pData(gse_raw))
+gse_raw
+```
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+boxplot_gse_raw <- file.path(fig_dir, "boxplot_gse_raw.pdf")
+pdf(boxplot_gse_raw, width=8, height=5)
+colores <- c(rep("red", 3), rep("blue", 3),
+             rep("green", 3), rep("yellow", 3))
+boxplot(gse_raw, cex.axis=0.5, las=2,  which="all", 
+ col = colores, main="Distribución de intensidades gse_raw")
+dev.off()
+boxplot(gse_raw, cex.axis=0.5, las=2,  which="all", 
+ col = colores, main="Distribución de intensidades gse_raw")
+```
+
+Se observa mayor variabilidad en las grupos de muestras GSM455118, GSM455119, GSM455120 y GSM455124, GSM455125, GSM455126 que son de la **LineaCelular** HPB.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+hcluster_gse_raw <- hclust(dist(t(exprs(gse_raw))), method="average")
+hcluster_gse_raw_name <- file.path(fig_dir, "hcluster_gse_raw.pdf")
+pdf(hcluster_gse_raw_name, width=8, height=5)
+plot(hcluster_gse_raw, main="Conglomerados jerarquicos gse_raw", 
+     cex=0.7, hang=1)
+dev.off()
+plot(hcluster_gse_raw, main="Conglomerados jerarquicos gse_raw", 
+     cex=0.7, hang=1)
+```
+
+EL plot de conglomerados confirma que las muestras que pertenecen a la misma **LineaCelular** se agrupan.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+pca_gse_raw_name <- file.path(fig_dir, "pca_gse_raw.pdf")
+pdf(pca_gse_raw_name, width=8, height=5)
+plotPCA3(exprs(gse_raw), labels=targets_df$Muestra, factor=targets_df$Grupo, 
+         title="gse_raw", scale=FALSE, size=3, 
+         colores = c("red", "blue", "green", "yellow"))
+dev.off()
+plotPCA3(exprs(gse_raw), labels=targets_df$Muestra, factor=targets_df$Grupo, 
+         title="gse_raw", scale=FALSE, size=3, 
+         colores = c("red", "blue", "green", "yellow"))
+```
+
+EL plot de PCA nos muestra que la primera componente explica el $\approx 90 \%$ de variabilidad y confirma lo que nos muestró el plot de conglomerados jerárquico pues separa a las muestras con diferente **LineaCelular**.
+
+Se puede hacer un anaálisis de control de calidad, pero nos mostrará información que hemos visto en los boxpplots, conglomerado jerárquico y PCA.
+
+```{r, eval=FALSE}
+# El reporte de calidad se genera como un directorio HTML aparte;
+# se deja desactivado para no incluir el reporte en la compilación.
+rerun <- FALSE
+if (rerun) {
+  arrayQualityMetrics(gse_raw, outdir="qa_report_gse_raw", force=TRUE)
+}
+```
+
+Se normalizan los datos con la funcion \texttt{rma}.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+# se normaliza el objeto 'gse' y se obtiene
+# un objeto de clase "ExpressionSet"
+if (!exists("eset_rma")) {
+  eset_rma <- rma(gse_raw)
+}
+rerun <- FALSE
+if (rerun) {
+  eset_rma_name <- file.path(res_dir, "eset_rma.txt")
+  write.exprs(eset_rma, eset_rma_name)
+}
+eset_rma
+```
+
+Se realiza un análisis de efecto de lote (\texttt{batch}).
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+# se selecciona el umbral de filtrado
+pct_threshold <- 0.6
+# se seleccionan los factores a anaizar
+batch.factors <- c("LineaCelular", "Tratamiento")
+#run the analysis
+objeto_pvca <- pvcaBatchAssess(eset_rma, batch.factors, pct_threshold)
+```
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+pvca_eset_rma_name <- file.path(fig_dir, "pvca_eset_rma.pdf")
+pdf(pvca_eset_rma_name, width=8, height=5)
+# se muestran los resultados
+bp <- barplot(objeto_pvca$dat, xlab = "Effects",
+  ylab = "Weighted average proportion variance",
+  ylim= c(0,1.1),col = c("mediumorchid"), las=2,
+  main="Estimación PVCA")
+axis(1, at = bp, labels=objeto_pvca$label, cex.axis = 0.75, las=2)
+values = objeto_pvca$dat
+new_values = round(values , 3)
+text(bp,objeto_pvca$dat,labels=new_values, pos=3, cex = 0.7)
+dev.off()
+bp <- barplot(objeto_pvca$dat, xlab = "Effects",
+  ylab = "Weighted average proportion variance",
+  ylim= c(0,1.1),col = c("mediumorchid"), las=2,
+  main="Estimación PVCA eset_rma")
+axis(1, at = bp, labels=objeto_pvca$label, cex.axis = 0.75, las=2)
+values = objeto_pvca$dat
+new_values = round(values , 3)
+text(bp,objeto_pvca$dat,labels=new_values, pos=3, cex = 0.7)
+```
+
+El plot PVCA nos muestra que la mayor variabilidad proviene de **LineaCelular** que es un factor biológico por lo que se puede descartar el impacto del efecto de lote.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+if (!exists("eset_filter")) {
+  # se filta el objeto 'eset_rma'
+  annotation(eset_rma) <- "hgu133plus2.db"
+  eset_filter <- nsFilter(eset_rma, var.func=IQR, var.cutoff=0.75,
+    var.filter=TRUE, require.entrez=TRUE, remove.dupEntrez=TRUE, 
+    filterByQuantile=TRUE)
+  eset_f <- eset_filter$eset        # ExpressionSet filtrado
+  filter_log <- eset_filter$filter.log # resumen de sondas descartadas
+  # se guardar en disco
+  eset_f_name <- file.path(res_dir, "eset_f.rds")
+  filter_log_name <- file.path(res_dir, "filter_log.rds")
+  if (!file.exists(eset_f_name)) {
+    saveRDS(eset_f, eset_f_name)
+  }
+  if (!file.exists(filter_log_name)) {
+    saveRDS(filter_log, filter_log_name)  
+  }
+}
+eset_filter
+```
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+# se extraen los datos filtrados
+FilteredEset <- eset_filter$eset
+FilteredData <- exprs(FilteredEset)
+colnames(FilteredData) <- pData(eset_filter$eset)$Muestra
+```
+
+
+### Modelo lineal
+
+Para cada gen $g$, el modelo lineal es:
+
+$$
+y_{gij} = \mu_{gi} + \varepsilon_{gij}, \quad
+i \in \{\text{KOPT.DMSO}, \text{HPB.DMSO}, \text{KOPT.SAHM1}, \text{HPB.SAHM1}\},
+\quad j = 1, 2, 3
+$$
+
+donde $y_{gij}$ es la expresión normalizada de la réplica $j$ del grupo $i$,
+$\mu_{gi}$ es la media del grupo y $\varepsilon_{gij} \sim N(0, \sigma_g^2)$ es
+el error aleatorio. En forma de matriz se escribe como
+$\mathbf{y}_g = \mathbf{X}\boldsymbol{\beta}_g + \boldsymbol{\varepsilon}_g$.
+
+Como el diseño es factorial, el modelo también se puede parametrizar en
+términos de los efectos principales y la interacción:
+
+$$
+y_{gijk} = \mu_g + \alpha_{g,i} + \beta_{g,j} + (\alpha\beta)_{g,ij} + \varepsilon_{gijk}
+$$
+
+con $i \in \{\text{KOPT-K1}, \text{HPB-ALL}\}$ (línea celular),
+$j \in \{\text{DMSO}, \text{SAHM1}\}$ (tratamiento), y $(\alpha\beta)_{ij}$ el
+efecto de interacción. Esta parametrización es equivalente a la de grupos y
+será la que dé lugar al contraste (c) de la sección siguiente.
+
+## 2. Matriz de diseño
+
+La matriz de diseño $\mathbf{X}$ tiene una fila por muestra (12) y una columna
+por grupo (4). Se arma sin intercepto (`~ 0 + Grupo`), igual que en el
+material: cada fila lleva un 1 en la columna de su grupo y 0 en las demás.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+designMat1 <- model.matrix(~ 0 + Grupo, data=targets_df)
+colnames(designMat1) <- levels(targets_df$Grupo)
+rownames(designMat1) <- targets_df$Muestra
+designMat1[, ]
+```
+
+En notación matricial:
+
+$$
+\mathbf{X}\boldsymbol{\beta} =
+\begin{pmatrix}
+1 & 0 & 0 & 0 \\
+1 & 0 & 0 & 0 \\
+1 & 0 & 0 & 0 \\
+0 & 1 & 0 & 0 \\
+0 & 1 & 0 & 0 \\
+0 & 1 & 0 & 0 \\
+0 & 0 & 1 & 0 \\
+0 & 0 & 1 & 0 \\
+0 & 0 & 1 & 0 \\
+0 & 0 & 0 & 1 \\
+0 & 0 & 0 & 1 \\
+0 & 0 & 0 & 1
+\end{pmatrix}
+\begin{pmatrix}
+\mu_{\text{KOPT.DMSO}} \\
+\mu_{\text{HPB.DMSO}} \\
+\mu_{\text{KOPT.SAHM1}} \\
+\mu_{\text{HPB.SAHM1}}
+\end{pmatrix}
+$$
+
+## 3. Matriz de contrastes
+
+La matriz de contrastes $\mathbf{C}$ tiene una fila por cada coeficiente del
+modelo (los 4 grupos) y una columna por cada comparación. Los coeficientes de
+cada columna suman cero:
+
+a. Efecto de SAHM1 en KOPT-K1: $\mu_{\text{KOPT.SAHM1}} - \mu_{\text{KOPT.DMSO}}$.
+b. Efecto de SAHM1 en HPB-ALL: $\mu_{\text{HPB.SAHM1}} - \mu_{\text{HPB.DMSO}}$.
+c. Interacción (la diferencia entre los dos efectos anteriores):
+$(\mu_{\text{KOPT.SAHM1}} - \mu_{\text{KOPT.DMSO}}) - (\mu_{\text{HPB.SAHM1}} - \mu_{\text{HPB.DMSO}})$.
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+cont.matrix1 <- makeContrasts(
+  SAHM1vsDMSO.KOPT = KOPT.SAHM1 - KOPT.DMSO,
+  SAHM1vsDMSO.HPB  = HPB.SAHM1  - HPB.DMSO,
+  INT = (KOPT.SAHM1 - KOPT.DMSO) - (HPB.SAHM1 - HPB.DMSO),
+  levels = designMat1)
+cont.matrix1
+```
+
+Es decir:
+
+$$
+\mathbf{C} =
+\begin{array}{l}
+\text{KOPT.DMSO} \\  \text{HPB.DMSO} \\ \text{KOPT.SAHM1} \\ \text{HPB.SAHM1}
+\end{array}
+\begin{pmatrix}
+-1 &  0 & -1 \\
+ 0 & -1 &  1 \\
+ 1 &  0 &  1 \\
+ 0 &  1 & -1
+\end{pmatrix}
+$$
+
+Las columnas corresponden, en orden, a los contrastes a, b y c. Para cada gen se
+estima $\boldsymbol{\gamma}_g = \mathbf{C}^{T}\hat{\boldsymbol{\beta}}_g$, que
+contiene los tres contrastes de interés.
+
+## 4. Análisis
+
+Esta actividad pide únicamente el **planteamiento** del modelo, por lo que el
+ajuste no se ejecuta. Se deja el código como referencia del flujo que seguiría
+el análisis completo, siguiendo los pasos del material [@gonzalo2019microarrays]:
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+# se ajuste del modelo
+fit1      <- lmFit(FilteredData, designMat1)
+fit.main1 <- contrasts.fit(fit1, cont.matrix1)
+fit.main1 <- eBayes(fit.main1)
+```
+
+
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+# se generan las tablas de resultados por contraste
+topTab_KOPT <- topTable(fit.main1, number=nrow(fit.main1), adjust="fdr",
+                        coef="SAHM1vsDMSO.KOPT", lfc=1, p.value=0.1)
+topTab_HPB <- topTable(fit.main1, number=nrow(fit.main1), adjust="fdr",
+                        coef="SAHM1vsDMSO.HPB", lfc=1, p.value=0.1)
+topTab_INT <- topTable(fit.main1, number=nrow(fit.main1), adjust="fdr",
+                        coef="INT", lfc=1, p.value=0.1)
+```
+
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+topAnnotated_KOPT <- annotatedTopTable(topTab_KOPT, anotPackage="hgu133plus2.db")
+topAnnotated_HPB <- annotatedTopTable(topTab_HPB, anotPackage="hgu133plus2.db")
+topAnnotated_INT <- annotatedTopTable(topTab_INT, anotPackage="hgu133plus2.db")
+
+rownames(topAnnotated_KOPT) <- topAnnotated_KOPT$PROBEID
+rownames(topAnnotated_HPB) <- topAnnotated_HPB$PROBEID
+rownames(topAnnotated_INT) <- topAnnotated_INT$PROBEID
+
+topAnnotated_KOPT
+topAnnotated_HPB
+topAnnotated_INT
+```
+
+
+```{r, message=FALSE, warning=FALSE, comment=NA}
+geneSymbols <- select(hgu133plus2.db, rownames(fit.main1), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+
+volcano_name_KPOT <- file.path(fig_dir, "volcano_KPOT.pdf")
+volcano_name_HPB <- file.path(fig_dir, "volcano_HPB.pdf")
+volcano_name_INT <- file.path(fig_dir, "volcano_INT.pdf")
+vol_names <- c(volcano_name_KPOT, volcano_name_HPB, volcano_name_INT)
+for (i in 1:length(colnames(fit.main1))) {
+  pdf(vol_names[i])
+  volcanoplot(fit.main1, coef=i, highlight=4, names=SYMBOLS, 
+  main=paste("Genes diferencialmente expresados",
+            colnames(cont.matrix1)[i], sep="\n"))
+  abline(v=c(-1,1))
+  dev.off()
+  volcanoplot(fit.main1, coef=i, highlight=4, names=SYMBOLS, 
+  main=paste("Genes diferencialmente expresados",
+            colnames(cont.matrix1)[i], sep="\n"))
+  abline(v=c(-1,1))
+}
+```
+
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+res <- decideTests(fit.main1, method="separate", adjust.method="fdr",
+                   p.value=0.1, lfc=1)
+```
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+sum.res.rows <- apply(abs(res), 1, sum)
+res.selected <-res[sum.res.rows!=0,] 
+print(summary(res))
+```
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+vennDiagram (res.selected[,1:3], cex=0.9)
+title("Comparación de genes en los 3 contrastes con FDR < 0.1 y logFC > 1")
+```
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+probesInHeatmap <- rownames(res.selected)
+HMdata <- exprs(eset_f)[rownames(exprs(eset_f)) %in% probesInHeatmap,]
+
+geneSymbols_HM <- select(hgu133plus2.db, rownames(HMdata), c("SYMBOL"))
+SYMBOLS_HM <- geneSymbols_HM$SYMBOL
+
+rownames(HMdata) <- SYMBOLS_HM
+write.csv(HMdata, file = file.path(res_dir,"data4Heatmap.csv"))
+```
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+my_palette <- colorRampPalette(c("blue", "red"))(n = 299)
+
+hm_name_no <- file.path(fig_dir, "heatmap_no_group.pdf")
+pdf(hm_name_no, width=8, height=5)
+heatmap.2(HMdata,
+          Rowv = FALSE,
+          Colv = FALSE,
+          main = "Genes diferencialmente expresados \n FDR < 0,1, logFC >=2",
+          scale = "row",
+          col = my_palette,
+          sepcolor = "white",
+          sepwidth = c(0.05,0.05),
+          cexRow = 0.5,
+          cexCol = 0.9,
+          key = TRUE,
+          keysize = 1.5,
+          density.info = "histogram",
+          ColSideColors = colores,
+          tracecol = NULL,
+          dendrogram = "none",
+          srtCol = 30)
+dev.off()
+heatmap.2(HMdata,
+          Rowv = FALSE,
+          Colv = FALSE,
+          main = "Genes diferencialmente expresados \n FDR < 0,1, logFC >=2",
+          scale = "row",
+          col = my_palette,
+          sepcolor = "white",
+          sepwidth = c(0.05,0.05),
+          cexRow = 0.5,
+          cexCol = 0.9,
+          key = TRUE,
+          keysize = 1.5,
+          density.info = "histogram",
+          ColSideColors = colores,
+          tracecol = NULL,
+          dendrogram = "none",
+          srtCol = 30)
+```
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+hm_name <- file.path(fig_dir, "heatmap.pdf")
+pdf(hm_name, width=8, height=5)
+heatmap.2(HMdata,
+          Rowv = TRUE,
+          Colv = TRUE,
+          dendrogram = "both",
+          main = "Genes diferencialmente expresados \n FDR < 0,1, logFC >=2",
+          scale = "row",
+          col = my_palette,
+          sepcolor = "white",
+          sepwidth = c(0.05,0.05),
+          cexRow = 0.5,
+          cexCol = 0.9,
+          key = TRUE,
+          keysize = 1.5,
+          density.info = "histogram",
+          ColSideColors = colores,
+          tracecol = NULL,
+          srtCol = 30)
+dev.off()
+heatmap.2(HMdata,
+          Rowv = TRUE,
+          Colv = TRUE,
+          dendrogram = "both",
+          main = "Genes diferencialmente expresados \n FDR < 0,1, logFC >=2",
+          scale = "row",
+          col = my_palette,
+          sepcolor = "white",
+          sepwidth = c(0.05,0.05),
+          cexRow = 0.5,
+          cexCol = 0.9,
+          key = TRUE,
+          keysize = 1.5,
+          density.info = "histogram",
+          ColSideColors = colores,
+          tracecol = NULL,
+          srtCol = 30)
+```
+
+
+```{r, message=FALSE, warning=FALSE, comment=FALSE}
+listOfTables <- list(
+  KOPT=topAnnotated_KOPT,
+  HPB=topAnnotated_HPB,
+  INT=topAnnotated_INT
+)
+listOfSelected <- list()
+for (i in 1:length(listOfTables)) {
+  # se selecciona la toptable
+  topTab <- listOfTables[[i]]
+  # se seleccionan los genes para ser incluidos
+  whichGenes <- topTab["adj.P.Val"] < 0.15
+  selectedIDs <- rownames(topTab)[whichGenes]
+  # se convierte el ID a Entrez
+  EntrezIDs <- select(hgu133plus2.db, selectedIDs, c("ENTREZID"))
+  EntrezIDs <- EntrezIDs$ENTREZID
+  listOfSelected[[i]] <- EntrezIDs
+  names(listOfSelected)[i] <- names(listOfTables)[i]
+}
+sapply(listOfSelected, length)
+```
+
+```{r}
+mapped_genes2GO <- mappedkeys(org.Hs.egGO)
+mapped_genes2KEGG <- mappedkeys(org.Hs.egPATH)
+mapped_genes <- union(mapped_genes2GO , mapped_genes2KEGG)
+```
+
+```{r BiologicalSig}
+listOfData <- listOfSelected[1:2]
+comparisonsNames <- names(listOfData)
+universe <- mapped_genes
+
+for (i in 1:length(listOfData)){
+  genesIn <- listOfData[[i]]
+  comparison <- comparisonsNames[i]
+  enrich.result <- enrichPathway(gene = genesIn,
+                                 pvalueCutoff = 0.05,
+                                 readable = T,
+                                 pAdjustMethod = "BH",
+                                 organism = "human",
+                                 universe = universe)
+  
+  cat("##################################")
+  cat("\nComparison: ", comparison,"\n")
+  print(head(enrich.result))
+
+  if (length(rownames(enrich.result@result)) != 0) {
+  write.csv(as.data.frame(enrich.result), 
+             file =paste0("./resultados/","ReactomePA.Results.",comparison,".csv"), 
+             row.names = FALSE)
+  
+  pdf(file=paste0("./resultados/","ReactomePABarplot.",comparison,".pdf"))
+    print(barplot(enrich.result, showCategory = 15, font.size = 4, 
+            title = paste0("Reactome Pathway Analysis for ", comparison,". Barplot")))
+  dev.off()
+  
+  pdf(file = paste0("./resultados/","ReactomePAcnetplot.",comparison,".pdf"))
+    print(cnetplot(enrich.result, categorySize=~Count, showCategory = 15, 
+         node_label_size=3, node_label="all"))
+  dev.off()
+  }
+}
+```
+
+
+# Conclusiones
+
+- El experimento es un diseño factorial $2\times2$ (línea celular $\times$
+  tratamiento) con 3 réplicas por grupo. Se modela con una matriz de diseño
+  $12 \times 4$ sin intercepto, donde cada coeficiente es la media de un grupo.
+- La matriz de contrastes $4 \times 3$ responde las tres preguntas: el efecto
+  de SAHM1 en KOPT-K1, el efecto de SAHM1 en HPB-ALL y la interacción.
+
+
+# Referencias
